@@ -57,41 +57,41 @@ SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
 
 # ── Filtros de calidad — CALIBRADOS ───────────────────────────────────
-MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "45.0"))   # era 62 → 45
-MIN_CONFLUENCES  = int(os.environ.get("MIN_CONFLUENCES",  "4"))      # era 5/7 → 4/6
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "45.0"))
+MIN_CONFLUENCES  = int(os.environ.get("MIN_CONFLUENCES",  "4"))
 MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.20"))
-ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "4.0"))    # era 3.5 → 4.0
+ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "4.0"))
 
 # ── EMAs ──────────────────────────────────────────────────────────────
 EMA_FAST         = int(os.environ.get("EMA_FAST",   "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",   "21"))
-EMA_TREND        = int(os.environ.get("EMA_TREND",  "50"))           # era 100 → 50
-SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT", "12.0"))      # era 28 → 12
-SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",   "5"))          # era 3 → 5
+EMA_TREND        = int(os.environ.get("EMA_TREND",  "50"))
+SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT", "12.0"))
+SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",   "5"))
 
 # ── ADX / RSI ─────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",  "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN", "18.0"))          # era 25 → 18
+ADX_MIN          = float(os.environ.get("ADX_MIN", "18.0"))
 RSI_LEN          = int(os.environ.get("RSI_LEN",  "14"))
 RSI_OB           = float(os.environ.get("RSI_OB",  "72.0"))
 RSI_OS           = float(os.environ.get("RSI_OS",  "28.0"))
-VOL_MULT         = float(os.environ.get("VOL_MULT", "0.9"))          # era 1.3 → 0.9
+VOL_MULT         = float(os.environ.get("VOL_MULT", "0.9"))
 
 # ── SuperTrend ────────────────────────────────────────────────────────
 ST_PERIOD        = int(os.environ.get("ST_PERIOD",  "10"))
 ST_MULT          = float(os.environ.get("ST_MULT",  "3.0"))
 
 # ── TP / SL ───────────────────────────────────────────────────────────
-TP_MULT          = float(os.environ.get("TP_MULT",       "2.0"))     # era 3.0 → 2.0
+TP_MULT          = float(os.environ.get("TP_MULT",       "2.0"))
 SL_ATR_MULT      = float(os.environ.get("SL_ATR_MULT",   "1.5"))
-MIN_RR           = float(os.environ.get("MIN_RR",        "1.5"))     # era 2.5 → 1.5
+MIN_RR           = float(os.environ.get("MIN_RR",        "1.5"))
 
 # ── Position sizing ───────────────────────────────────────────────────
 MIN_ORDER_USDT   = float(os.environ.get("MIN_ORDER_USDT", "5.0"))
 MAX_ORDER_USDT   = float(os.environ.get("MAX_ORDER_USDT", "50.0"))
 MAX_MARGIN_PCT   = float(os.environ.get("MAX_MARGIN_PCT", "30.0"))
 
-# ── Sesión — DESACTIVADA por defecto (era el problema) ────────────────
+# ── Sesión — DESACTIVADA por defecto ──────────────────────────────────
 SESSION_FILTER   = os.environ.get("SESSION_FILTER", "false").lower() == "true"
 SESSION_START    = int(os.environ.get("SESSION_START", "6"))
 SESSION_END      = int(os.environ.get("SESSION_END",  "22"))
@@ -140,7 +140,8 @@ cb_pause_until = None
 # ══════════════════════════════════════════════════════════════════════
 def _sign(params):
     qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(BINGX_SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    # FIX: hmac.new → hmac.new es correcto pero debe ser bytes
+    return hmac.new(BINGX_SECRET_KEY.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def bx_get(path, params=None):
     p = dict(params or {})
@@ -155,7 +156,7 @@ def bx_post(path, payload):
     p = dict(payload)
     p["timestamp"] = int(time.time() * 1000)
     p["signature"] = _sign(p)
-    r = requests.post(BINGX_BASE + path, json=p,
+    r = requests.post(BINGX_BASE + path, params=p,   # FIX: BingX POST usa params en URL + body vacío
                       headers={"X-BX-APIKEY": BINGX_API_KEY,
                                "Content-Type":"application/json"}, timeout=15)
     r.raise_for_status()
@@ -351,38 +352,44 @@ def calc_supertrend(high, low, close, period=10, mult=3.0):
     upper_raw = hl2 + mult * atr
     lower_raw = hl2 - mult * atr
 
-    direction = pd.Series(1, index=close.index, dtype=int)
-    final_ub  = upper_raw.copy()
-    final_lb  = lower_raw.copy()
+    # FIX: usar listas en lugar de .iloc[i]= para evitar SettingWithCopyWarning y bugs
+    n         = len(close)
+    direction = [1] * n
+    final_ub  = list(upper_raw)
+    final_lb  = list(lower_raw)
+    close_v   = list(close)
 
-    for i in range(1, len(close)):
+    for i in range(1, n):
         # Upper band
-        if upper_raw.iloc[i] < final_ub.iloc[i-1] or close.iloc[i-1] > final_ub.iloc[i-1]:
-            final_ub.iloc[i] = upper_raw.iloc[i]
+        if upper_raw.iloc[i] < final_ub[i-1] or close_v[i-1] > final_ub[i-1]:
+            final_ub[i] = float(upper_raw.iloc[i])
         else:
-            final_ub.iloc[i] = final_ub.iloc[i-1]
+            final_ub[i] = final_ub[i-1]
         # Lower band
-        if lower_raw.iloc[i] > final_lb.iloc[i-1] or close.iloc[i-1] < final_lb.iloc[i-1]:
-            final_lb.iloc[i] = lower_raw.iloc[i]
+        if lower_raw.iloc[i] > final_lb[i-1] or close_v[i-1] < final_lb[i-1]:
+            final_lb[i] = float(lower_raw.iloc[i])
         else:
-            final_lb.iloc[i] = final_lb.iloc[i-1]
+            final_lb[i] = final_lb[i-1]
         # Direction
-        if close.iloc[i] > final_ub.iloc[i-1]:
-            direction.iloc[i] = 1
-        elif close.iloc[i] < final_lb.iloc[i-1]:
-            direction.iloc[i] = -1
+        if close_v[i] > final_ub[i-1]:
+            direction[i] = 1
+        elif close_v[i] < final_lb[i-1]:
+            direction[i] = -1
         else:
-            direction.iloc[i] = direction.iloc[i-1]
+            direction[i] = direction[i-1]
 
-    return direction
+    return pd.Series(direction, index=close.index, dtype=int)
 
 def calc_heikin_ashi(df):
+    ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+    ha_open  = ha_close.copy()
+    ha_open_vals = list(ha_open)
+    ha_close_vals = list(ha_close)
+    for i in range(1, len(df)):
+        ha_open_vals[i] = (ha_open_vals[i-1] + ha_close_vals[i-1]) / 2
     ha = df.copy()
-    ha["ha_close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
-    ha["ha_open"]  = ha["ha_close"].copy()
-    for i in range(1, len(ha)):
-        ha.at[ha.index[i], "ha_open"] = \
-            (ha["ha_open"].iloc[i-1] + ha["ha_close"].iloc[i-1]) / 2
+    ha["ha_close"] = ha_close_vals
+    ha["ha_open"]  = ha_open_vals
     return ha
 
 def calc_vwap(df):
@@ -426,7 +433,6 @@ def analyze_h1(symbol):
     st_now    = int(st_dir.iloc[-1])
     rsi_now   = float(rsi_h1.iloc[-1])
 
-    # H1 trend: EMA alineadas O SuperTrend (no ambas requeridas)
     bull_h1 = (ema7_now > ema21_now) or (st_now == 1)
     bear_h1 = (ema7_now < ema21_now) or (st_now == -1)
 
@@ -448,10 +454,6 @@ def analyze_h1(symbol):
 #  PATRONES DE VELA
 # ══════════════════════════════════════════════════════════════════════
 def detect_candle_pattern(df, i, direction, atr_val):
-    """
-    Detecta Pin Bar, Engulfing o Momentum candle.
-    Retorna (pattern_name, pattern_score, sl_candle_price).
-    """
     if i < 1:
         return "NONE", 0.0, None
 
@@ -534,7 +536,6 @@ def open_order(symbol, side, qty, sl, tp):
     return resp
 
 def open_order_with_retry(symbol, side, qty, sl, tp, atr_val, direction, retries=1):
-    """Reintenta con precio fresco si error 101400."""
     for attempt in range(retries + 1):
         try:
             return open_order(symbol, side, qty, sl, tp)
@@ -553,6 +554,10 @@ def open_order_with_retry(symbol, side, qty, sl, tp, atr_val, direction, retries
                     tp = live - (sl - live) * TP_MULT
                 sl = round(sl, 6)
                 tp = round(tp, 6)
+                # FIX: recalcular qty con precio fresco
+                qty_new, _ = calc_qty(get_balance(), live, sl)
+                if qty_new > 0:
+                    qty = qty_new
             else:
                 raise
 
@@ -567,7 +572,6 @@ def scan_symbol(symbol):
             return None
 
     try:
-        # ── Datos 5m ─────────────────────────────────────────────────
         df = get_klines(symbol, 200)
         if df.empty or len(df) < 100:
             return None
@@ -636,7 +640,6 @@ def scan_symbol(symbol):
         if direction == "SHORT" and close_now > ema_t_now: return None
 
         # ══ SISTEMA DE CONFLUENCIAS V15 — 6 FILTROS, MÍNIMO 4 ════════
-        # Más permisivo que V14 (7 filtros, mínimo 5) pero con calidad
         confluences  = 0
         conf_detail  = {}
 
@@ -668,7 +671,7 @@ def scan_symbol(symbol):
         if vol_ok: confluences += 1
         conf_detail["vol"] = f"{'✅' if vol_ok else '❌'}{vratio:.1f}x"
 
-        # C6: Squeeze OFF (mercado expandido)
+        # C6: Squeeze OFF
         if sqz_ok: confluences += 1
         conf_detail["sqz"] = "✅OFF" if sqz_ok else "❌ON"
 
@@ -686,9 +689,9 @@ def scan_symbol(symbol):
             elif h1_trend == "BEAR" and direction == "SHORT":
                 h1_bonus = 20
             elif h1_trend == "NEUTRAL":
-                h1_bonus = 5   # neutral permitido, pequeño bonus
+                h1_bonus = 5
             else:
-                return None    # H1 contra señal → descarte
+                return None
 
         # ── Patrón de vela ────────────────────────────────────────────
         pat_name, pat_score, sl_candle = detect_candle_pattern(df, i, direction, atr_val)
@@ -723,15 +726,13 @@ def scan_symbol(symbol):
             return None
 
         # ── SCORING V15 ───────────────────────────────────────────────
-        # confluencias (max 30) + H1 (max 20) + patrón (max 15)
-        # + ADX (max 10) + ángulo (max 10) + vol (max 10) + RR (max 5)
-        score  = (confluences / 6) * 30                                # max 30
-        score += h1_bonus                                               # max 20
-        score += min(pat_score / 7, 15)                                # max 15
-        score += min((adx_now - ADX_MIN) / ADX_MIN * 10, 10)          # max 10
-        score += min(abs(angle_now) / SLOPE_LIMIT * 10, 10)            # max 10
-        score += min(vratio * 5, 10)                                    # max 10
-        score += min((rr - MIN_RR) * 2, 5)                             # max 5
+        score  = (confluences / 6) * 30
+        score += h1_bonus
+        score += min(pat_score / 7, 15)
+        score += min((adx_now - ADX_MIN) / ADX_MIN * 10, 10)
+        score += min(abs(angle_now) / SLOPE_LIMIT * 10, 10)
+        score += min(vratio * 5, 10)
+        score += min((rr - MIN_RR) * 2, 5)
 
         if score < MIN_SCORE:
             return None
@@ -839,7 +840,6 @@ def tg_entry(sig, qty, notional, balance):
     )
 
 def tg_zero_signals(total, cycle):
-    """Cada 5 ciclos sin señales, avisa con contexto."""
     tg(
         f"⚠️ <b>0 señales / {total} símbolos</b> (ciclo #{cycle})\n"
         f"<b>Parámetros activos:</b>\n"
@@ -870,7 +870,6 @@ def main():
     positions = get_all_positions()
     log.info(f"Balance: {balance:.4f} | Symbols: {len(symbols)} | Open: {len(positions)}")
 
-    # Pre-cargar H1 en background
     def _prefetch():
         log.info("Pre-cargando H1 cache...")
         sample = symbols[:80]
@@ -893,7 +892,6 @@ def main():
         t0     = time.time()
         cycle += 1
         try:
-            # ── Session filter ────────────────────────────────────────
             if SESSION_FILTER:
                 hour = datetime.now(timezone.utc).hour
                 if not (SESSION_START <= hour < SESSION_END):
@@ -901,7 +899,6 @@ def main():
                     time.sleep(300)
                     continue
 
-            # ── Circuit breaker ───────────────────────────────────────
             if cb_pause_until and datetime.now(timezone.utc) < cb_pause_until:
                 rem = (cb_pause_until - datetime.now(timezone.utc)).seconds // 60
                 log.info(f"🛑 Circuit breaker: {rem}min restantes.")
@@ -917,7 +914,6 @@ def main():
                 f"{len(symbols)} sym | ciclo #{cycle} ──"
             )
 
-            # ── Scan ──────────────────────────────────────────────────
             signals = []
             with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
                 futs = {ex.submit(scan_symbol, s): s for s in symbols}
@@ -931,7 +927,7 @@ def main():
 
             if not signals:
                 zero_sig_runs += 1
-                if zero_sig_runs % 5 == 1:   # avisa cada 5 ciclos sin señales
+                if zero_sig_runs % 5 == 1:
                     tg_zero_signals(len(symbols), cycle)
             else:
                 zero_sig_runs = 0
@@ -944,7 +940,6 @@ def main():
                         f"adx={s['adx']} rr=1:{s['rr']}"
                     )
 
-            # ── Ejecutar órdenes ──────────────────────────────────────
             entered      = set()
             skip_reasons = {}
 
@@ -966,11 +961,9 @@ def main():
                 try:
                     set_lev(sym)
 
-                    # Precio en vivo
                     live = get_live_price(sym)
                     log.info(f"Live {sym}: scan={sig['close']:.6g} live={live:.6g}")
 
-                    # Recalcular SL/TP
                     atr_val   = sig["atr"]
                     direction = sig["signal"]
                     if direction == "LONG":
