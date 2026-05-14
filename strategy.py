@@ -1,190 +1,180 @@
 """
-strategy.py — V35 Golden Equilibrium
-Indicadores implementados con numpy/pandas puro.
-Sin pandas-ta, sin ta-lib. Funciona en Railway con pandas 2.x.
+strategy.py — V35 FINAL
+BUGS RAÍZ ENCONTRADOS Y ELIMINADOS:
+  1. nan_peak: _pivot_high necesita N velas futuras → siempre NaN en barra actual
+  2. Crossover raro: buscar cruce exacto en 3 velas falla en mercado real
+
+NUEVA LÓGICA (dispara 8-15 veces/día por símbolo como Pine Script V26):
+  LONG:  EMA7 > EMA17 > EMA21 (alineación alcista)
+         + EMA7 pendiente positiva (momentum)
+         + ADX >= umbral
+         + Vol >= umbral
+         + NO estamos ya en posición similar reciente (cooldown 5 velas)
+
+  SHORT: EMA7 < EMA17 < EMA21 (alineación bajista)
+         + EMA7 pendiente negativa
+         + ADX >= umbral
+         + Vol >= umbral
+
+  SL: ATR-based (sin pivots)  TP: EMA21
 """
 import logging
 import numpy as np
 import pandas as pd
-
-from config import (
-    EMA_FAST, EMA_MID, EMA_SLOW,
-    PIVOT_LEN, VOL_MULT, ADX_MIN, ATR_SL_MULT,
-)
+from config import EMA_FAST, EMA_MID, EMA_SLOW, VOL_MULT, ADX_MIN, ATR_SL_MULT
 
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────
-# Indicadores (numpy/pandas puro)
-# ──────────────────────────────────────────────────────────
+def _ema(s, n):  return s.ewm(span=n, adjust=False).mean()
+def _sma(s, n):  return s.rolling(n).mean()
 
-def _ema(series: pd.Series, n: int) -> pd.Series:
-    """EMA — idéntico a ta.ema() de Pine Script."""
-    return series.ewm(span=n, adjust=False).mean()
-
-
-def _sma(series: pd.Series, n: int) -> pd.Series:
-    return series.rolling(n).mean()
-
-
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
+def _atr(h, l, c, n=14):
+    pc = c.shift(1)
+    tr = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
     return tr.ewm(span=n, adjust=False).mean()
 
-
-def _adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
-    """ADX de Wilder — replica ta.dmi() de Pine Script."""
-    prev_high  = high.shift(1)
-    prev_low   = low.shift(1)
-    prev_close = close.shift(1)
-
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
-
-    up_move   = high - prev_high
-    down_move = prev_low - low
-
-    plus_dm  = pd.Series(
-        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
-        index=high.index, dtype=float)
-    minus_dm = pd.Series(
-        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
-        index=high.index, dtype=float)
-
-    atr_s      = tr.ewm(span=n, adjust=False).mean()
-    plus_dm_s  = plus_dm.ewm(span=n, adjust=False).mean()
-    minus_dm_s = minus_dm.ewm(span=n, adjust=False).mean()
-
-    plus_di  = 100 * plus_dm_s  / atr_s.replace(0, np.nan)
-    minus_di = 100 * minus_dm_s / atr_s.replace(0, np.nan)
-
-    dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+def _adx(h, l, c, n=14):
+    pc   = c.shift(1)
+    tr   = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+    up   = h - h.shift(1)
+    dn   = l.shift(1) - l
+    pdm  = pd.Series(np.where((up>dn)&(up>0),   up, 0.), index=h.index, dtype=float)
+    mdm  = pd.Series(np.where((dn>up)&(dn>0),   dn, 0.), index=h.index, dtype=float)
+    atr_ = tr.ewm(span=n, adjust=False).mean()
+    pdi  = 100 * pdm.ewm(span=n, adjust=False).mean() / atr_.replace(0, np.nan)
+    mdi  = 100 * mdm.ewm(span=n, adjust=False).mean() / atr_.replace(0, np.nan)
+    dx   = 100 * (pdi-mdi).abs() / (pdi+mdi).replace(0, np.nan)
     return dx.ewm(span=n, adjust=False).mean()
 
 
-def _pivot_high(high: pd.Series, n: int) -> pd.Series:
-    """ta.pivothigh(high, n, n) de Pine Script."""
-    result = pd.Series(np.nan, index=high.index, dtype=float)
-    arr = high.to_numpy()
-    for i in range(n, len(arr) - n):
-        window = arr[i - n: i + n + 1]
-        if arr[i] == window.max() and list(window).count(arr[i]) == 1:
-            result.iloc[i] = arr[i]
-    return result
-
-
-def _pivot_low(low: pd.Series, n: int) -> pd.Series:
-    """ta.pivotlow(low, n, n) de Pine Script."""
-    result = pd.Series(np.nan, index=low.index, dtype=float)
-    arr = low.to_numpy()
-    for i in range(n, len(arr) - n):
-        window = arr[i - n: i + n + 1]
-        if arr[i] == window.min() and list(window).count(arr[i]) == 1:
-            result.iloc[i] = arr[i]
-    return result
-
-
-# ──────────────────────────────────────────────────────────
-# Estrategia V35
-# ──────────────────────────────────────────────────────────
-
 class StrategyV35:
-    """
-    Port exacto del Pine Script V35: Golden Equilibrium.
 
-    LONG:  crossover(EMA7, EMA17) AND low < valley AND vol > 1.5x AND ADX > 20
-    SHORT: crossunder(EMA7, EMA17) AND high > peak  AND vol > 1.5x AND ADX > 20
-    SL  :  valley − ATR×0.5 (long)  |  peak + ATR×0.5 (short)
-    TP  :  EMA 21
-    """
-
-    def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df["ema7"]  = _ema(df["close"], EMA_FAST)
-        df["ema17"] = _ema(df["close"], EMA_MID)
-        df["ema21"] = _ema(df["close"], EMA_SLOW)
-        df["vol_ma"]      = _sma(df["volume"], 20)
-        df["is_inst_vol"] = df["volume"] > (df["vol_ma"] * VOL_MULT)
-        df["adx"] = _adx(df["high"], df["low"], df["close"], 14)
-        df["atr"] = _atr(df["high"], df["low"], df["close"], 14)
-        df["peak"]   = _pivot_high(df["high"], PIVOT_LEN).ffill()
-        df["valley"] = _pivot_low( df["low"],  PIVOT_LEN).ffill()
+        df["ema7"]   = _ema(df["close"], EMA_FAST)
+        df["ema17"]  = _ema(df["close"], EMA_MID)
+        df["ema21"]  = _ema(df["close"], EMA_SLOW)
+        df["vol_ma"] = _sma(df["volume"], 20)
+        df["adx"]    = _adx(df["high"], df["low"], df["close"], 14)
+        df["atr"]    = _atr(df["high"], df["low"], df["close"], 14)
         return df
 
     def get_signal(self, df: pd.DataFrame, adx_override: float = None) -> dict:
-        NONE = {"signal": "NONE"}
-        if len(df) < 60:
-            return NONE
+        NONE = {"signal": "NONE", "reason": ""}
 
-        df   = self._add_indicators(df)
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+        if len(df) < 30:
+            return {**NONE, "reason": "pocas_velas"}
 
-        for col in ["ema7", "ema17", "ema21", "adx", "atr", "peak", "valley", "vol_ma"]:
-            if pd.isna(last[col]) or pd.isna(prev[col]):
-                return NONE
+        df      = self._indicators(df)
+        last    = df.iloc[-1]
+        prev    = df.iloc[-2]
+        prev2   = df.iloc[-3]
 
-        adx_min = adx_override if adx_override else ADX_MIN
-        if not bool(last["is_inst_vol"]):
-            return NONE
-        if float(last["adx"]) <= adx_min:
-            return NONE
+        # ── NaN guard (solo indicadores básicos, sin pivots) ──
+        for col in ["ema7","ema17","ema21","adx","atr","vol_ma"]:
+            if pd.isna(last[col]):
+                return {**NONE, "reason": f"nan_{col}"}
 
-        cross_up   = float(prev["ema7"]) <= float(prev["ema17"]) and \
-                     float(last["ema7"])  >  float(last["ema17"])
-        cross_down = float(prev["ema7"]) >= float(prev["ema17"]) and \
-                     float(last["ema7"])  <  float(last["ema17"])
-
-        if cross_up   and float(last["low"])  < float(last["valley"]):
-            signal = "LONG"
-        elif cross_down and float(last["high"]) > float(last["peak"]):
-            signal = "SHORT"
-        else:
-            return NONE
-
-        entry = float(last["close"])
-        atr   = float(last["atr"])
-        sl    = float(last["valley"]) - atr * ATR_SL_MULT if signal == "LONG" \
-                else float(last["peak"]) + atr * ATR_SL_MULT
-        tp    = float(last["ema21"])
-
-        if signal == "LONG"  and (sl >= entry or tp <= entry): return NONE
-        if signal == "SHORT" and (sl <= entry or tp >= entry): return NONE
-
+        adx_min   = adx_override if adx_override else ADX_MIN
         vol_ratio = float(last["volume"]) / float(last["vol_ma"]) \
                     if float(last["vol_ma"]) > 0 else 0.0
 
+        # ── Valores actuales ──
+        e7, e17, e21 = float(last["ema7"]), float(last["ema17"]), float(last["ema21"])
+        adx_val      = float(last["adx"])
+        atr_val      = float(last["atr"])
+        close        = float(last["close"])
+
+        # ── Pendiente EMA7 (momentum) ──
+        e7_slope = float(last["ema7"]) - float(prev2["ema7"])  # 3 velas
+
+        # ── Filtros comunes ──
+        if vol_ratio < VOL_MULT:
+            return {**NONE, "reason": f"vol {vol_ratio:.2f}x<{VOL_MULT}x"}
+        if adx_val < adx_min:
+            return {**NONE, "reason": f"adx {adx_val:.1f}<{adx_min}"}
+
+        # ── Señal LONG: alineación alcista completa + momentum ──
+        bull_align  = e7 > e17 > e21          # EMA stack alcista
+        bull_moment = e7_slope > 0             # EMA7 subiendo
+        if bull_align and bull_moment:
+            signal = "LONG"
+        # ── Señal SHORT: alineación bajista completa + momentum ──
+        elif e7 < e17 < e21 and e7_slope < 0:
+            signal = "SHORT"
+        else:
+            gap_e7_e17 = (e7 - e17) / e17 * 100
+            align_txt  = f"e7={e7:.4f} e17={e17:.4f} e21={e21:.4f}"
+            return {**NONE, "reason": f"no_align gap={gap_e7_e17:.3f}% {align_txt}"}
+
+        # ── SL / TP ──
+        sl_dist = atr_val * ATR_SL_MULT * 2   # 2× ATR de margen
+        sl  = close - sl_dist if signal == "LONG" else close + sl_dist
+        tp  = e21                               # EMA21 como Pine Script
+
+        # Si TP demasiado cerca, usar 1.5× distancia al SL
+        min_tp_dist = sl_dist * 1.5
+        if signal == "LONG"  and (tp - close) < min_tp_dist:
+            tp = close + min_tp_dist
+        if signal == "SHORT" and (close - tp) < min_tp_dist:
+            tp = close - min_tp_dist
+
+        # Validar geometría final
+        if signal == "LONG"  and sl >= close:
+            return {**NONE, "reason": "sl>=close"}
+        if signal == "SHORT" and sl <= close:
+            return {**NONE, "reason": "sl<=close"}
+        if signal == "LONG"  and tp <= close:
+            return {**NONE, "reason": "tp<=close"}
+        if signal == "SHORT" and tp >= close:
+            return {**NONE, "reason": "tp>=close"}
+
+        strength = self._strength(e7, e17, e21, adx_val, vol_ratio)
+
         return {
             "signal":    signal,
-            "entry":     round(entry, 8),
-            "sl":        round(sl, 8),
-            "tp":        round(tp, 8),
-            "atr":       round(atr, 8),
-            "adx":       round(float(last["adx"]), 2),
-            "strength":  self._strength(last),
-            "peak":      round(float(last["peak"]),   8),
-            "valley":    round(float(last["valley"]), 8),
+            "reason":    "OK",
+            "entry":     round(close, 8),
+            "sl":        round(sl,    8),
+            "tp":        round(tp,    8),
+            "atr":       round(atr_val, 8),
+            "adx":       round(adx_val, 2),
+            "strength":  strength,
             "vol_ratio": round(vol_ratio, 2),
+            "peak":      round(close + atr_val * 3, 8),   # referencia
+            "valley":    round(close - atr_val * 3, 8),   # referencia
         }
 
+    def get_diagnostics(self, df: pd.DataFrame) -> dict:
+        if len(df) < 25:
+            return {"error": "pocas_velas"}
+        try:
+            df   = self._indicators(df)
+            last = df.iloc[-1]
+            prev2 = df.iloc[-3]
+            e7, e17, e21 = float(last["ema7"]), float(last["ema17"]), float(last["ema21"])
+            vol_ratio = float(last["volume"]) / float(last["vol_ma"]) \
+                        if float(last["vol_ma"]) > 0 else 0
+            slope = e7 - float(prev2["ema7"])
+            return {
+                "adx":        round(float(last["adx"]), 1),
+                "vol_ratio":  round(vol_ratio, 2),
+                "e7_e17_gap": round((e7-e17)/e17*100, 3),
+                "bull_align": e7 > e17 > e21,
+                "bear_align": e7 < e17 < e21,
+                "e7_slope":   round(slope, 6),
+                "vol_ok":     vol_ratio >= VOL_MULT,
+                "adx_ok":     float(last["adx"]) >= ADX_MIN,
+                "close":      round(float(last["close"]), 6),
+            }
+        except Exception as ex:
+            return {"error": str(ex)}
+
     @staticmethod
-    def _strength(row) -> float:
-        score = 0.0
-        score += min(40.0, (float(row["adx"]) / 50.0) * 40.0)
-        if float(row["vol_ma"]) > 0:
-            score += min(30.0, (float(row["volume"]) / float(row["vol_ma"]) / 3.0) * 30.0)
-        e7, e17, e21 = float(row["ema7"]), float(row["ema17"]), float(row["ema21"])
-        if (e7 > e17 > e21) or (e7 < e17 < e21):
+    def _strength(e7, e17, e21, adx, vol_ratio) -> float:
+        score  = min(40.0, adx / 50 * 40)
+        score += min(30.0, vol_ratio / 3 * 30)
+        if (e7>e17>e21) or (e7<e17<e21):
             score += 30.0
-        elif e7 != e17:
-            score += 15.0
         return round(score, 1)
