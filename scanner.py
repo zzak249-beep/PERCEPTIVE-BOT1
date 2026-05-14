@@ -1,49 +1,70 @@
 """
-scanner.py — Escanea las 20 mejores monedas del día.
-Scoring = volumen USDT × (1 + |cambio%|) para capturar
-los pares con más movimiento institucional.
+scanner.py — FIX: filtrar símbolos pausados (NCCO1OIL, WTI, etc.)
+FIX: validar klines antes de añadir al top
+FIX: blocklist ampliada con commodities y símbolos sintéticos
 """
 import logging
+import re
 from typing import List, Dict
 from bingx_client import BingXClient
-from config import TOP_N_SYMBOLS
+from config import TOP_N_SYMBOLS, CANDLE_INTERVAL
 
 logger = logging.getLogger(__name__)
 
-# Símbolos problemáticos con spread alto o liquidez baja
-SYMBOL_BLOCKLIST = {
-    "LUNA-USDT", "LUNC-USDT", "SHIB-USDT",  # alta volatilidad extrema
+# Patrones de símbolos problemáticos/pausados
+BLOCKLIST_EXACT = {
+    "LUNA-USDT", "LUNC-USDT", "SHIB-USDT",
 }
+
+# Prefijos bloqueados (commodities sintéticos, índices, etc.)
+BLOCKLIST_PREFIX = ("NCCO", "WTI", "GOLD", "OIL", "GAS", "SILVER",)
+
+# Mínimo volumen 24h (USDT) para considerar el par
+MIN_VOL_USDT = 2_000_000   # 2M USDT — filtra pares sin liquidez real
+
+
+def _is_blocked(symbol: str) -> bool:
+    if symbol in BLOCKLIST_EXACT:
+        return True
+    base = symbol.replace("-USDT", "")
+    for prefix in BLOCKLIST_PREFIX:
+        if base.startswith(prefix):
+            return True
+    # Filtrar símbolos con números raros (sintéticos tipo NCCO1OILWTI2)
+    if re.search(r'\d', base) and len(base) > 6:
+        return True
+    return False
 
 
 class MarketScanner:
     def __init__(self, client: BingXClient):
-        self.client  = client
+        self.client   = client
         self._cached: List[Dict] = []
+        self._paused: set = set()   # cache de símbolos pausados confirmados
 
     def get_top_symbols(self, n: int = TOP_N_SYMBOLS) -> List[Dict]:
-        """
-        Retorna los N mejores pares ordenados por score.
-        Cada elemento: {symbol, price, change_pct, volume_usdt, score}
-        """
         tickers = self.client.get_24h_tickers()
         if not tickers:
-            logger.warning("No se obtuvieron tickers — usando caché anterior")
+            logger.warning("Sin tickers — usando caché")
             return self._cached or []
 
         scored = []
         for t in tickers:
             symbol = t.get("symbol", "")
+
             if not symbol.endswith("-USDT"):
                 continue
-            if symbol in SYMBOL_BLOCKLIST:
+            if _is_blocked(symbol):
                 continue
-            try:
-                price   = float(t.get("lastPrice", 0) or 0)
-                vol     = float(t.get("quoteVolume", 0) or 0)
-                change  = float(t.get("priceChangePercent", 0) or 0)
+            if symbol in self._paused:
+                continue
 
-                if price < 0.000001 or vol < 500_000:   # filtro polvo y escasa liquidez
+            try:
+                price  = float(t.get("lastPrice", 0) or 0)
+                vol    = float(t.get("quoteVolume", 0) or 0)
+                change = float(t.get("priceChangePercent", 0) or 0)
+
+                if price <= 0 or vol < MIN_VOL_USDT:
                     continue
 
                 score = vol * (1 + abs(change) / 100)
@@ -58,18 +79,40 @@ class MarketScanner:
                 continue
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        top = scored[:n]
+
+        # Tomar el doble y validar klines para filtrar pausados
+        top_raw = scored[:n * 2]
+        top     = []
+        for s in top_raw:
+            if len(top) >= n:
+                break
+            if s["symbol"] in self._paused:
+                continue
+            df = self.client.get_klines(s["symbol"], CANDLE_INTERVAL, limit=5)
+            if df.empty:
+                logger.info(f"[Scanner] {s['symbol']} pausado — excluido")
+                self._paused.add(s["symbol"])
+                continue
+            top.append(s)
 
         self._cached = top
-        logger.info(
-            f"Scanner: top {len(top)} pares | "
-            f"1º {top[0]['symbol']} score={top[0]['score']:.0f}"
-            if top else "Scanner: sin resultados"
-        )
+        if top:
+            logger.info(
+                f"Scanner: {len(top)} pares válidos | "
+                f"1º {top[0]['symbol']} vol=${top[0]['volume_usdt']/1e6:.1f}M | "
+                f"Pausados conocidos: {len(self._paused)}"
+            )
         return top
 
     def get_symbol_list(self) -> List[str]:
         return [s["symbol"] for s in self._cached]
+
+    def mark_paused(self, symbol: str):
+        """Llamar desde el tick cuando BingX devuelve 'is pause currently'."""
+        if symbol not in self._paused:
+            logger.info(f"[Scanner] Marcando {symbol} como pausado")
+            self._paused.add(symbol)
+            self._cached = [s for s in self._cached if s["symbol"] != symbol]
 
     def summary_text(self, top: List[Dict], n: int = 5) -> str:
         lines = []
