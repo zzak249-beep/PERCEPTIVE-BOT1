@@ -24,15 +24,21 @@ class LearningEngine:
 
         self.trades: list = self._load()
 
-        # Parámetros dinámicos — parten de los valores del config
+        # Parámetros dinámicos con límites duros (previene sobre-aprendizaje)
         self.params = {
-            "adx_min":     ADX_MIN,
+            "adx_min":      min(25.0, max(float(ADX_MIN), ADX_MIN)),
             "min_strength": 35.0,
-            "vol_mult":    VOL_MULT,
+            "vol_mult":     VOL_MULT,
         }
-
         # Resumen de aprendizaje acumulado
         self.adjustments: list = []
+        # Aplicar límites al arrancar (resetea si trades.json tiene valores extremos)
+        self._apply_hard_limits()
+
+    def _apply_hard_limits(self):
+        """Garantiza que los parámetros nunca excedan los límites seguros."""
+        self.params["adx_min"]      = max(float(ADX_MIN), min(25.0, self.params["adx_min"]))
+        self.params["min_strength"] = max(30.0,            min(55.0, self.params["min_strength"]))
 
     # ──────────────────────────────────────────────────────
     # Persistencia
@@ -103,24 +109,33 @@ class LearningEngine:
         old_params = dict(self.params)
         reason     = None
 
-        # ── Winrate bajo → endurecer filtros ──
-        if winrate < 40 and len(recent) >= 10:
-            self.params["adx_min"]     = min(35.0, self.params["adx_min"] + 2.0)
-            self.params["min_strength"] = min(65.0, self.params["min_strength"] + 5.0)
-            reason = f"WR bajo ({winrate:.0f}%) → filtros más estrictos"
+        # Límites duros — el bot nunca se paraliza por sobre-aprendizaje
+        ADX_HARD_MAX = 25.0   # máximo absoluto de ADX
+        ADX_HARD_MIN = float(ADX_MIN)
+        STR_HARD_MAX = 55.0   # máximo absoluto de fuerza
+        STR_HARD_MIN = 30.0
 
-        # ── Winrate alto → relajar levemente para capturar más señales ──
-        elif winrate > 65 and len(recent) >= 10:
-            self.params["adx_min"]     = max(float(ADX_MIN), self.params["adx_min"] - 1.0)
-            self.params["min_strength"] = max(30.0, self.params["min_strength"] - 2.0)
-            reason = f"WR alto ({winrate:.0f}%) → relajando filtros"
+        # ── WR crítico (<30%) → RESET completo a base ──
+        if winrate < 30 and len(recent) >= 15:
+            self.params["adx_min"]      = float(ADX_MIN)
+            self.params["min_strength"] = 35.0
+            reason = f"WR crítico {winrate:.0f}% → RESET parámetros base"
 
-        # ── Análisis de pérdidas: ADX bajo correlacionado ──
-        if losses and len(losses) >= 3:
-            avg_adx_loss = sum(t.get("adx", 0) or 0 for t in losses) / len(losses)
-            if avg_adx_loss < self.params["adx_min"] + 2 and not reason:
-                self.params["adx_min"] = min(30.0, self.params["adx_min"] + 1.0)
-                reason = f"Pérdidas correlacionadas con ADX bajo (media={avg_adx_loss:.1f})"
+        # ── WR bajo → endurecer MUY levemente ──
+        elif winrate < 40 and len(recent) >= 10:
+            self.params["adx_min"]      = min(ADX_HARD_MAX, self.params["adx_min"] + 1.0)
+            self.params["min_strength"] = min(STR_HARD_MAX, self.params["min_strength"] + 2.0)
+            reason = f"WR {winrate:.0f}% → ADX+1 fuerza+2"
+
+        # ── WR alto → relajar ──
+        elif winrate > 60 and len(recent) >= 10:
+            self.params["adx_min"]      = max(ADX_HARD_MIN, self.params["adx_min"] - 1.0)
+            self.params["min_strength"] = max(STR_HARD_MIN, self.params["min_strength"] - 2.0)
+            reason = f"WR {winrate:.0f}% → relajando filtros"
+
+        # Aplicar límites siempre, aunque no haya ajuste
+        self.params["adx_min"]      = max(ADX_HARD_MIN, min(ADX_HARD_MAX, self.params["adx_min"]))
+        self.params["min_strength"] = max(STR_HARD_MIN, min(STR_HARD_MAX, self.params["min_strength"]))
 
         if reason and old_params != self.params:
             self.adjustments.append({
