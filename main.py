@@ -56,6 +56,9 @@ class SniperBotV35:
             f"Histórico: {stats['total']} trades WR={stats['winrate']}%"
         )
         self.telegram.notify_startup(balance, len(self._top_symbols), dry_run=DRY_RUN)
+        # Enviar análisis de rentabilidad al arrancar si hay trades
+        if self.learning.trades:
+            self.telegram.notify_profitability(self.learning.trades)
 
     # ── Tareas programadas ────────────────────────────────
     def hourly_task(self):
@@ -143,6 +146,10 @@ class SniperBotV35:
                 dict(self._all_reasons), self._best_diag)
             self._all_reasons.clear()
             self._best_diag = {}
+
+        # Análisis de rentabilidad cada 20 ticks (~60 min)
+        if self._tick % 20 == 0 and self.learning.trades:
+            self.telegram.notify_profitability(self.learning.trades)
 
     # ── Abrir trade ───────────────────────────────────────
     def _open_trade(self, symbol: str, signal: dict, balance: float) -> str:
