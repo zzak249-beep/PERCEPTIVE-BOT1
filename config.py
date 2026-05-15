@@ -24,8 +24,8 @@ PIVOT_LEN         = 5
 VOL_MULT          = float(os.getenv("VOL_MULT",       "0.9"))
 ADX_MIN           = float(os.getenv("ADX_MIN",        "15"))
 ATR_SL_MULT       = float(os.getenv("ATR_SL_MULT",    "0.5"))
-CANDLE_INTERVAL   = os.getenv("CANDLE_INTERVAL",       "3m")
-TIME_STOP_CANDLES = 15
+CANDLE_INTERVAL   = os.getenv("CANDLE_INTERVAL",       "15m")
+TIME_STOP_CANDLES = 8    # 8 × 15min = 2h time-stop
 
 # ─── Riesgo ───────────────────────────────────────────────
 CAPITAL_PCT     = float(os.getenv("CAPITAL_PCT",     "2"))
