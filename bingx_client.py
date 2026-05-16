@@ -1,9 +1,9 @@
 """
-bingx_client.py — Cliente BingX Perpetual Futures
-FIX: Soporte modo ONE-WAY (sin positionSide)
-FIX: Firma HMAC correcta para POST
-FIX: set_leverage sin parámetro side (one-way)
-FIX: Validación de cantidad mínima
+bingx_client.py — BingX Perpetual Futures
+FIX CRÍTICO: Firma HMAC correcta según docs oficiales BingX
+  - timestamp + signature van SIEMPRE en query string (GET y POST)
+  - Para POST: params del body en query string para la firma, body vacío
+  - Ref: https://bingx-api.github.io/docs/#/en-us/spot/account-api.html
 """
 import hashlib
 import hmac
@@ -33,85 +33,74 @@ class BingXClient:
         self.session    = requests.Session()
         self.session.headers.update({
             "X-BX-APIKEY": self.api_key,
+            "Content-Type": "application/json",
         })
         mode = "HEDGE" if HEDGE_MODE else "ONE-WAY"
-        logger.info(f"BingXClient iniciado en modo {mode}")
+        logger.info(f"BingXClient modo {mode}")
 
-    # ──────────────────────────────────────────────────────
-    # Firma HMAC-SHA256
-    # ──────────────────────────────────────────────────────
-    def _timestamp(self) -> int:
-        return int(time.time() * 1000)
+    # ── Firma ──────────────────────────────────────────────
+    def _timestamp(self) -> str:
+        return str(int(time.time() * 1000))
 
-    def _sign(self, payload: str) -> str:
+    def _sign(self, query_string: str) -> str:
+        """HMAC-SHA256 sobre el query string completo."""
         return hmac.new(
             self.secret_key.encode("utf-8"),
-            payload.encode("utf-8"),
+            query_string.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
-    def _signed_get_params(self, params: dict) -> dict:
-        """Para GET: añade timestamp y firma al query string."""
-        params = dict(params)
-        params["timestamp"] = self._timestamp()
-        raw = urlencode(sorted(params.items()))
-        params["signature"] = self._sign(raw)
-        return params
-
-    def _signed_post_body(self, params: dict) -> str:
+    def _build_signed_query(self, params: dict) -> str:
         """
-        Para POST: BingX exige firma sobre el body sin signature,
-        luego añade signature al body final.
+        Construye query string con timestamp y signature.
+        BingX: firma = HMAC(todos los params excepto signature, ordenados).
         """
-        params = dict(params)
+        params = {k: str(v) for k, v in params.items()}
         params["timestamp"] = self._timestamp()
-        # Firma sobre params ordenados sin signature
-        raw = urlencode(sorted(params.items()))
-        params["signature"] = self._sign(raw)
-        return urlencode(params)
+        # Ordenar alfabéticamente y construir query string
+        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        sig = self._sign(qs)
+        return f"{qs}&signature={sig}"
 
-    # ──────────────────────────────────────────────────────
-    # HTTP helpers
-    # ──────────────────────────────────────────────────────
+    # ── HTTP ───────────────────────────────────────────────
     def _get(self, endpoint: str, params: dict = None, signed: bool = False) -> dict:
         params = params or {}
-        if signed:
-            params = self._signed_get_params(params)
         try:
-            resp = self.session.get(
-                f"{self.base_url}{endpoint}", params=params, timeout=10
-            )
+            if signed:
+                qs  = self._build_signed_query(params)
+                url = f"{self.base_url}{endpoint}?{qs}"
+                resp = self.session.get(url, timeout=10)
+            else:
+                resp = self.session.get(
+                    f"{self.base_url}{endpoint}", params=params, timeout=10
+                )
             return resp.json()
         except Exception as e:
-            logger.error(f"GET {endpoint} error: {e}")
+            logger.error(f"GET {endpoint}: {e}")
             return {"code": -1, "msg": str(e)}
 
     def _post(self, endpoint: str, params: dict) -> dict:
-        body = self._signed_post_body(params)
+        """
+        BingX POST: todos los params (incluyendo timestamp y signature)
+        van en el query string de la URL. Body vacío.
+        """
         try:
-            resp = self.session.post(
-                f"{self.base_url}{endpoint}",
-                data=body,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=10,
-            )
+            qs   = self._build_signed_query(params)
+            url  = f"{self.base_url}{endpoint}?{qs}"
+            resp = self.session.post(url, timeout=10)
             data = resp.json()
             if data.get("code") != 0:
-                logger.warning(f"POST {endpoint} → code={data.get('code')} msg={data.get('msg')}")
+                logger.warning(
+                    f"POST {endpoint} code={data.get('code')} "
+                    f"msg={data.get('msg','')[:120]}"
+                )
             return data
         except Exception as e:
-            logger.error(f"POST {endpoint} error: {e}")
+            logger.error(f"POST {endpoint}: {e}")
             return {"code": -1, "msg": str(e)}
 
-    # ──────────────────────────────────────────────────────
-    # Datos de mercado
-    # ──────────────────────────────────────────────────────
-    def get_klines(self, symbol: str, interval: str, limit: int = 150) -> pd.DataFrame:
-        """
-        Retorna DataFrame OHLCV.
-        NOTA: el último elemento [-1] es la vela actual aún abierta.
-              Usar [-2] como última vela CERRADA.
-        """
+    # ── Mercado (sin firma) ────────────────────────────────
+    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         data = self._get(
             "/openApi/swap/v2/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
@@ -119,23 +108,20 @@ class BingXClient:
         if data.get("code") != 0 or not data.get("data"):
             msg = data.get("msg", "")
             if "pause" in msg.lower():
-                logger.warning(f"[PAUSED] {symbol}: {msg}")
-                return pd.DataFrame({"_paused": [True]})  # señal especial
+                logger.warning(f"[PAUSED] {symbol}")
+                return pd.DataFrame({"_paused": [True]})
             logger.debug(f"Klines vacías {symbol}: {msg}")
             return pd.DataFrame()
 
         raw = data["data"]
-        # BingX puede devolver lista de dicts o lista de listas
         if isinstance(raw[0], dict):
             df = pd.DataFrame(raw)
-            # renombrar si las claves difieren
-            rename = {"t": "time", "o": "open", "h": "high",
-                      "l": "low", "c": "close", "v": "volume"}
-            df.rename(columns=rename, inplace=True)
+            df.rename(columns={"t":"time","o":"open","h":"high",
+                                "l":"low","c":"close","v":"volume"}, inplace=True)
         else:
-            df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
+            df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"])
 
-        for col in ["open", "high", "low", "close", "volume"]:
+        for col in ["open","high","low","close","volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         if "time" in df.columns:
@@ -143,14 +129,12 @@ class BingXClient:
             df.sort_values("time", inplace=True)
             df.reset_index(drop=True, inplace=True)
 
-        # Descartar la vela actual (aún abierta) — usar solo velas cerradas
-        df = df.iloc[:-1].copy()
-        return df
+        return df.iloc[:-1].copy()   # descartar vela abierta actual
 
     def get_24h_tickers(self) -> list:
         data = self._get("/openApi/swap/v2/quote/ticker")
         if data.get("code") != 0:
-            logger.error(f"Tickers error: {data.get('msg')}")
+            logger.error(f"Tickers: {data.get('msg')}")
             return []
         return data.get("data", [])
 
@@ -161,9 +145,7 @@ class BingXClient:
         except Exception:
             return 0.0
 
-    # ──────────────────────────────────────────────────────
-    # Cuenta
-    # ──────────────────────────────────────────────────────
+    # ── Cuenta (con firma) ─────────────────────────────────
     def get_balance(self) -> float:
         data = self._get(
             "/openApi/swap/v2/user/balance", {"currency": "USDT"}, signed=True
@@ -178,45 +160,23 @@ class BingXClient:
         data = self._get("/openApi/swap/v2/user/positions", {}, signed=True)
         if data.get("code") != 0:
             return []
-        return [
-            p for p in data.get("data", [])
-            if float(p.get("positionAmt", 0)) != 0
-        ]
+        return [p for p in data.get("data", [])
+                if float(p.get("positionAmt", 0)) != 0]
 
-    # ──────────────────────────────────────────────────────
-    # Apalancamiento
-    # ──────────────────────────────────────────────────────
+    # ── Apalancamiento ─────────────────────────────────────
     def set_leverage(self, symbol: str, leverage: int):
-        """
-        FIX: En one-way mode NO se envía 'side'.
-             En hedge mode se envía 'side=LONG' y 'side=SHORT'.
-        """
         if ONE_WAY_MODE:
-            res = self._post("/openApi/swap/v2/trade/leverage", {
-                "symbol": symbol, "leverage": leverage,
-            })
+            res = self._post("/openApi/swap/v2/trade/leverage",
+                             {"symbol": symbol, "leverage": leverage})
             logger.debug(f"Leverage {symbol} x{leverage}: {res.get('code')}")
         else:
             for side in ("LONG", "SHORT"):
-                self._post("/openApi/swap/v2/trade/leverage", {
-                    "symbol": symbol, "side": side, "leverage": leverage,
-                })
+                self._post("/openApi/swap/v2/trade/leverage",
+                           {"symbol": symbol, "side": side, "leverage": leverage})
 
-    # ──────────────────────────────────────────────────────
-    # Órdenes
-    # ──────────────────────────────────────────────────────
-    def place_order(
-        self,
-        symbol: str,
-        side: str,           # "BUY" o "SELL"
-        position_side: str,  # "LONG" o "SHORT" (solo hedge)
-        quantity: float,
-        leverage: int = 5,
-    ) -> dict:
-        """
-        Abre posición de mercado.
-        FIX ONE-WAY: omite positionSide, usa reduceOnly=false.
-        """
+    # ── Órdenes ───────────────────────────────────────────
+    def place_order(self, symbol: str, side: str, position_side: str,
+                    quantity: float, leverage: int = 5) -> dict:
         if DRY_RUN:
             logger.info(f"[DRY] place_order {side} {symbol} qty={quantity:.4f}")
             return {"code": 0, "data": {"orderId": "DRY"}}
@@ -227,30 +187,21 @@ class BingXClient:
             "symbol":   symbol,
             "side":     side,
             "type":     "MARKET",
-            "quantity": round(quantity, 4),
+            "quantity": f"{quantity:.4f}",
         }
-
         if HEDGE_MODE:
             params["positionSide"] = position_side
-        # ONE-WAY: sin positionSide
 
         result = self._post("/openApi/swap/v2/trade/order", params)
-        logger.info(f"[ORDER] {side} {symbol} qty={quantity:.4f} → code={result.get('code')} {result.get('msg','')}")
+        logger.info(
+            f"[ORDER] {side} {symbol} qty={quantity:.4f} "
+            f"→ code={result.get('code')} {result.get('msg','')[:60]}"
+        )
         return result
 
-    def place_stop_order(
-        self,
-        symbol: str,
-        side: str,
-        position_side: str,
-        stop_price: float,
-        quantity: float,
-        order_type: str = "STOP_MARKET",
-    ) -> dict:
-        """
-        Coloca SL o TP.
-        FIX ONE-WAY: usa reduceOnly=true en lugar de positionSide.
-        """
+    def place_stop_order(self, symbol: str, side: str, position_side: str,
+                         stop_price: float, quantity: float,
+                         order_type: str = "STOP_MARKET") -> dict:
         if DRY_RUN:
             return {"code": 0}
 
@@ -258,25 +209,19 @@ class BingXClient:
             "symbol":      symbol,
             "side":        side,
             "type":        order_type,
-            "stopPrice":   round(stop_price, 8),
-            "quantity":    round(quantity, 4),
+            "stopPrice":   f"{stop_price:.8f}",
+            "quantity":    f"{quantity:.4f}",
             "workingType": "MARK_PRICE",
         }
-
         if HEDGE_MODE:
             params["positionSide"] = position_side
         else:
             params["reduceOnly"] = "true"
 
-        result = self._post("/openApi/swap/v2/trade/order", params)
-        logger.debug(f"[STOP] {order_type} {symbol} stop={stop_price:.6f} → code={result.get('code')}")
-        return result
+        return self._post("/openApi/swap/v2/trade/order", params)
 
-    def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
-        """
-        Cierra posición a mercado.
-        FIX ONE-WAY: usa reduceOnly=true.
-        """
+    def close_position(self, symbol: str, position_side: str,
+                       quantity: float) -> dict:
         if DRY_RUN:
             return {"code": 0}
 
@@ -285,9 +230,8 @@ class BingXClient:
             "symbol":   symbol,
             "side":     close_side,
             "type":     "MARKET",
-            "quantity": round(quantity, 4),
+            "quantity": f"{quantity:.4f}",
         }
-
         if HEDGE_MODE:
             params["positionSide"] = position_side
         else:
@@ -298,16 +242,11 @@ class BingXClient:
     def cancel_all_orders(self, symbol: str) -> dict:
         if DRY_RUN:
             return {"code": 0}
-        return self._post(
-            "/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol}
-        )
+        return self._post("/openApi/swap/v2/trade/allOpenOrders",
+                          {"symbol": symbol})
 
-    # ──────────────────────────────────────────────────────
-    # Validación de cantidad mínima
-    # ──────────────────────────────────────────────────────
     def validate_qty(self, qty: float, price: float) -> tuple:
-        """(qty_final, ok, motivo)"""
         notional = qty * price
         if notional < MIN_ORDER_USDT:
-            return 0.0, False, f"Notional ${notional:.2f} < mínimo ${MIN_ORDER_USDT}"
+            return 0.0, False, f"Notional ${notional:.2f} < min ${MIN_ORDER_USDT}"
         return qty, True, "OK"
